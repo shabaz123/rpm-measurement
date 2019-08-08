@@ -1,0 +1,454 @@
+
+/************************************
+ * RPM measurement tool
+ * rev 2.0 - shabaz - August 2019
+ * 		A rewrite of the algorithm, for more
+ * 		accuracy and granularity.
+ * 		This version also has a calibration value
+ * 		that needs to be calculated and placed
+ * 		in the CORRECTION_FACTOR constant.
+ * rev 1.0 - shabaz - June 2017
+ * 		Original version, simpler but
+ * 		not so granular or accurate.
+ *
+ * Connections:
+ * P1.0 - pin2  - LED (present on MSP-EXP430G2 dev board)
+ * P1.6 - pin14 - SCL (needs a pull-up resistor!)
+ * P1.7 - pin15 - SDA (needs a pull-up resistor!)
+ * P2.0 - pin8  - optotransistor input
+ * P2.1 - pin9  - LCD reset
+ * P2.5 - pin13 - optional button
+ * ***********************************/
+
+// #includes
+#include <msp430.h>
+
+// #defines
+#define LED1_ON P1OUT |= BIT0
+#define LED1_OFF P1OUT &= ~BIT0
+#define LCD_RES_HIGH P2OUT |= BIT1
+#define LCD_RES_LOW P2OUT &= ~BIT1
+#define MS50 50000
+#define LCD_ADDR 0x3e
+#define ROW_TOP 0
+#define ROW_BOTTOM 1
+#define USE_XTAL
+#ifdef USE_XTAL
+#define ITER 1
+#define CCRINC 32760
+#else
+#define ITER 16
+#define CCRINC 62500
+#endif
+// related to the slowest rotation, to determine when rotation is considered stopped. The ticks are at 8MHz, and one overflow is a count of 2^16.
+#define MAX_OVER 611
+
+// use a known frequency (e.g. by connecting an LED to a mains transformer, for blinking at 50 or 60Hz)
+// to calculate the correction factor.
+#define CORRECTION_FACTOR 1.0
+
+// global variables
+const char lcd_init_arr[]={ 0x38, 0x39, 0x14, 0x7f, 0x51, 0x6c, 0x0c, 0x01 };
+unsigned char *PTxData;                     // Pointer to TX data
+unsigned char TXByteCtr=0;
+unsigned char led_toggle=0;
+unsigned char clk_iter=0;
+unsigned char lcd_refresh=0;
+
+unsigned char compute_period=0;
+unsigned char valid=0; // this variable is set to 1 when we're happy to display the value derived from the variable capture_data
+unsigned long capture_data=0; // this is the period in ticks, that is ultimately converted into Hz and RPM
+unsigned long capture_delta=0; 	// this stores the period in ticks too, but an older calculation. It is compared with capture_data, to see if it approximately matches.
+								// if it doesn't match closely, then we reject the measurement. If it closely matches, then valid is set to 1.
+unsigned long capture_latch_old=0; // storage of the timer value when a capture occurs on a falling edge
+unsigned long capture_ctr=0; // this contains the number of overflows times 65536, plus the current timer value when a capture occurs
+unsigned char blink=1;
+unsigned int num_over=0; // count the number of overflows, to determine if rotation has stopped
+char tstring[14];
+unsigned int capval; // stores the 16-bit timer value when a capture occurs
+
+
+// function prototypes
+void lcd_init(void);
+void lcd_clear(void);
+void lcd_setpos(char ln, char idx);
+void lcd_print(char* str);
+void uint2str(unsigned long number, char* ta);
+void i2c_write(char* data, char len);
+void compute_period_function(void);
+
+/************************************
+ * interrupt functions
+ ************************************/
+// we use timer 0 as a gate to see how many pulses were captured within a certain time
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer_A(void)
+{
+ CCR0 =+ CCRINC;    // increment the compare register for the next interrupt to occur
+ clk_iter++;
+ if (clk_iter>=ITER)
+ {
+     clk_iter=0;
+     lcd_refresh=1;     // we are ready to update the LCD display
+ }
+
+ // toggle an LED (present on the development board) as a heartbeat indication
+ if (led_toggle)
+ {
+    LED1_OFF;
+    led_toggle=0;
+ }
+ else
+ {
+    LED1_ON;
+    led_toggle=1;
+ }
+}
+
+// we use timer 1 to do input capture
+#pragma vector = TIMER1_A0_VECTOR
+__interrupt void Timer_1(void)
+{
+	// there is some rotation. Clear num_over counter which is only used to determine that.
+	num_over=0;
+
+	capval=(unsigned int) TA1CCR0;
+	compute_period=1;
+}
+
+// this is the timer 1 vector for overflow
+#pragma vector = TIMER1_A1_VECTOR
+__interrupt void Timer_1_overflow(void)
+{
+	// increase the capture_ctr value by 0x10000. This is needed because the capture register is only 16 bits and we need to measure longer periods
+	capture_ctr=((unsigned long)capture_ctr)+65536UL;
+
+	// num_over is used to determine if rotation has completely stopped, when this reaches a high value.
+	num_over++;
+	if (num_over>=MAX_OVER)
+	{
+		num_over=MAX_OVER;
+	}
+
+	if (TA1CCTL0 & COV)
+	{
+		TA1CCTL0 &= ~COV;
+	}
+
+	TA1CTL &= ~TAIFG;
+}
+// interrupt to load the serial comms register to stream out bytes of I2C
+#pragma vector = USCIAB0TX_VECTOR
+__interrupt void USCIAB0TX_ISR(void)
+{
+  if (TXByteCtr)                            // Check TX byte counter
+  {
+    UCB0TXBUF = *PTxData++;                 // Load TX buffer
+    TXByteCtr--;                            // Decrement TX byte counter
+  }
+  else
+  {
+    UCB0CTL1 |= UCTXSTP;                    // I2C stop condition
+    IFG2 &= ~UCB0TXIFG;                     // Clear USCI_B0 TX int flag
+    __bic_SR_register_on_exit(CPUOFF);      // Exit LPM0
+  }
+}
+
+/************************************
+ * main function
+ ************************************/
+int
+main(void)
+{
+	float manip;
+	float manip2;
+	unsigned long hz100;
+    WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
+
+    // clock configuration
+#ifdef USE_XTAL
+    // Set up 32768Hz crystal
+    BCSCTL3 |= XCAP_3;    // select 12pF caps
+     _delay_cycles(10000); // allow xtal time to start up
+#else
+    //
+#endif
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_8MHZ;
+    DCOCTL = CALDCO_8MHZ;
+
+    // I/O pin configuration
+	P1OUT = 0;
+	P2OUT = 0;
+	P3OUT = 0;
+    P1DIR |= BIT0; // set P1 pin 0 (LED) output
+    P2DIR |= BIT1; // set P2 pin 1 (LCD Reset) output
+    P3DIR = 0;
+    P2SEL |= BIT0;
+
+    // I2C configuration
+    P1SEL |= BIT6 + BIT7;                     // Assign I2C pins to USCI_B0
+    P1SEL2|= BIT6 + BIT7;                     // Assign I2C pins to USCI_B0
+    UCB0CTL1 |= UCSWRST;                      // Enable SW reset
+    UCB0CTL0 = UCMST + UCMODE_3 + UCSYNC;     // I2C Master, synchronous mode
+    UCB0CTL1 = UCSSEL_2 + UCSWRST;            // Use SMCLK, keep SW reset
+    UCB0BR0 = 12;                             // fSCL = SMCLK/12 = ~100kHz
+    UCB0BR1 = 0;
+    UCB0I2CSA = LCD_ADDR;                       // Slave Address
+    UCB0CTL1 &= ~UCSWRST;                     // Clear SW reset, resume operation
+    IE2 |= UCB0TXIE;                          // Enable TX interrupt
+
+    // configure capture
+    // capture on falling edge on Timer 1 CCI0A (P2.0)
+    TA1CCTL0 = CAP + CM_2 + CCIE + SCS + CCIS_0;
+    TA1CTL |= TASSEL_2 + MC_2 + TACLR + TAIE + ID_0; // continuous mode
+
+    // configure timer
+    TA0CTL = TACLR; // reset the timer
+#ifdef USE_XTAL
+    TA0CTL = TASSEL_1 + MC_1 + ID_0; // ACLK/1
+#else
+    TA0CTL = TASSEL_2 + MC_1 + 0x0c; // SMCLK/8
+#endif
+    CCTL0 |= CCIE;
+    CCR0 = CCRINC;
+
+    __bis_SR_register(GIE); // enable interrupts
+
+    // initialize the LCD and print hello!
+    lcd_init();
+    lcd_setpos(ROW_TOP,0);
+    lcd_print("Hello");
+
+	// main program loop
+	while(1)
+	{
+		if (compute_period)
+			compute_period_function();
+	    if (lcd_refresh) // lcd_refresh is set every second by Timer 0, so that we only update the display every second.
+	    {
+	        if ((capture_delta==0UL) || (num_over>=MAX_OVER)) // no pulses counted
+	        {
+	        	lcd_refresh=0;
+	        	lcd_clear();
+	            lcd_setpos(ROW_TOP, 0);
+
+	            // colon is blinked, so user can see that the system isn't crashed and frozen..
+	            if (blink)
+	            {
+	            	lcd_print("Point at Target"); // print helpful suggestion
+	            	blink=0;
+	            }
+	            else
+	            {
+	            	lcd_print("Point at Target:"); // print helpful suggestion with a colon on the end
+	            	blink=1;
+	            }
+	        }
+	        else
+	        {
+	        	if (valid) // we have valid data to display
+	        	{
+	        	lcd_refresh=0;
+	        	lcd_clear();
+
+	        	// correct the period in ticks using the correction factor
+	    		manip=(float)capture_data;
+	    		manip=manip*CORRECTION_FACTOR;
+
+	    		// calculate the frequency in Hz:
+	    		manip2=(float)8000000.0/(float)manip;
+	    		manip2=manip2*100.0; // multiply by 100 so we can have a decimal place using integers
+	    		hz100=(unsigned long)manip2; // hz100 stores the result in Hz, scaled by 100.
+
+	    		// calculate RPM result
+	    		manip2=manip2*60.0;
+	    		capture_data=(unsigned long)manip2; // capture_data now contains the RPM, scaled by 100
+
+	        	// print result in Hz
+	        	lcd_setpos(ROW_TOP, 0);
+	        	lcd_print("Hz: ");
+	        	lcd_setpos(ROW_TOP, 5);
+	        	uint2str(hz100, tstring);
+	        	lcd_print(tstring);
+
+	        	// print result in RPM
+	        	lcd_setpos(ROW_BOTTOM, 0);
+	        	lcd_print("RPM: ");
+	        	lcd_setpos(ROW_BOTTOM, 5);
+	        	uint2str(capture_data, tstring);
+	        	lcd_print(tstring);
+	        	capture_data=0;
+	        	valid=0;
+	        	} // end if (valid)
+	        	else
+	        	{
+	        		// not valid, so lets loop until valid
+	        	}
+	        }
+	    }
+	}
+	
+	return 0; // warning on this line is ok
+}
+
+/************************************
+ * Other functions
+ ************************************/
+// LCD handling functions
+void
+lcd_init(void)
+{
+    unsigned int i;
+    LCD_RES_HIGH;
+    _delay_cycles(MS50);
+    LCD_RES_LOW;  // Put LCD into reset
+    _delay_cycles(MS50);
+    LCD_RES_HIGH; // Bring LCD out of reset
+    _delay_cycles(MS50);
+    char data[2];
+    data[0]=0;
+    // This loop is used to configure the LCD
+    for (i=0; i<8; i++)
+    {
+        data[1]=lcd_init_arr[i];
+        i2c_write(data, 2);
+    }
+    _delay_cycles(MS50);
+}
+
+void
+lcd_clear(void)
+{
+    char data[2];
+    data[0]=0;
+    data[1]=1;
+    i2c_write(data, 2);
+    _delay_cycles(MS50);
+}
+
+void
+lcd_setpos(char ln, char idx)
+{
+    char data [2];
+    data[0]=0;
+    if (ln==0)
+        data[1]=0x80+idx;   // 0x00 | 0x80
+    else
+        data[1]=0xc0+idx;   // 0x40 | 0x80
+    i2c_write(data, 2);
+}
+
+void
+lcd_print(char* str)
+{
+    char data[2];
+    data[0]=0x40;
+    while(*str != '\0')
+    {
+        data[1]=*str++;
+        i2c_write(data, 2);
+    }
+}
+
+// convert an unsigned integer (0-65535) into an ASCII string
+// this is used in place of sprintf. Based on some code found online: https://stackoverflow.com/questions/2709713/how-to-convert-unsigned-long-to-string
+void
+uint2str(unsigned long number, char* ta)
+{
+  unsigned long t = 0UL, res = 0UL;
+  unsigned long tmp = (unsigned long)number;
+  int count = 0;
+  int base=10;
+  char iter=0;
+
+
+  if (tmp == 0)
+  {
+    count++;
+  }
+
+  while(tmp > 0UL)
+  {
+    tmp = (unsigned long)tmp/(unsigned long)base;
+    count++;
+  }
+
+  ta += count;
+  ta++;
+
+  *ta = '\0';
+
+  do
+  {
+    res = (unsigned long)number - (unsigned long)base * (unsigned long)(t = (unsigned long)number / (unsigned long)base);
+    if (res < 10UL)
+    {
+      * -- ta = '0' + res;
+      iter++;
+      if (iter==2)
+      {
+    	  * -- ta = '.';
+      }
+    }
+    else if ((res >= 10UL) && (res < 16UL))
+    {
+        * --ta = 'A' - 10 + res;
+        iter++;
+        if (iter==2)
+        {
+      	  * -- ta = '.';
+        }
+    }
+  } while ((number = (unsigned long)t) != 0UL);
+
+}
+
+void
+i2c_write(char* data, char len)
+{
+    PTxData = (unsigned char *)data;                      // TX array start address
+    TXByteCtr = len;                  // Load TX byte counter
+    while (UCB0CTL1 & UCTXSTP);             // Ensure stop condition got sent
+    UCB0CTL1 |= UCTR + UCTXSTT;             // I2C TX, start condition
+    __bis_SR_register(CPUOFF + GIE);        // Enter LPM0 w/ interrupts until all data TX'd
+}
+
+void
+compute_period_function(void)
+{
+	unsigned long long_ccr;
+	long_ccr=(unsigned long)capval; // get the timer value into unsigned long
+
+	// this mess of apparent unsigned long casting everywhere is to make sure compiler doesn't default to 16-bit anywhere
+	// probably some of it is unnecessary, but some is needed..
+	capture_ctr=(unsigned long)capture_ctr+(unsigned long)long_ccr; // get the current timer value (and add to any overflow)
+
+	if ((unsigned long)capture_ctr>(unsigned long)capture_latch_old) // sanity check
+	{
+		capture_delta=(unsigned long)capture_ctr-(unsigned long)capture_latch_old; // the counter isn't ever reset, so the period is the delta between the previous stored value
+	}
+	capture_latch_old=(unsigned long)long_ccr; // store the current counter value, so the delta can be used on the next capture pulse
+	capture_ctr=0UL;
+
+	// are we prepared to print a measurement?
+	// only if the previous delta matches to within 100, as a kind of way of throwing out bad measurements
+	if ((unsigned long)capture_data>(unsigned long)capture_delta)
+	{
+		if ((unsigned long)capture_data-(unsigned long)capture_delta<100UL)
+			valid=1;
+	}
+	else
+	{
+		if ((unsigned long)capture_delta-(unsigned long)capture_data<100UL)
+			valid=1;
+	}
+
+	// if not valid, then store the current measured data
+	if (valid==0)
+	{
+		capture_data=((unsigned long)capture_delta);
+	}
+	compute_period=0;
+
+}
